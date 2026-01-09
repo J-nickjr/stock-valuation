@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>股票估值工具</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div id="app" class="max-w-xl mx-auto py-10 px-4">
+        <div class="bg-white shadow-lg rounded-lg p-6">
+            <h1 class="text-2xl font-bold text-center mb-6 text-blue-600">價值投資估值器</h1>
+            
+            <div class="space-y-4">
+                <input v-model="ticker" placeholder="股票代碼 (例如: TSLA)" class="w-full border p-3 rounded shadow-sm focus:ring-2 focus:ring-blue-400 outline-none">
+                <select v-model="industry" class="w-full border p-3 rounded shadow-sm">
+                    <option v-for="opt in industries" :key="opt" :value="opt">{{opt}}</option>
+                </select>
+                <button @click="calculate" :disabled="loading" class="w-full bg-blue-600 text-white font-bold py-3 rounded hover:bg-blue-700 transition disabled:bg-gray-400">
+                    {{ loading ? '數據計算中...' : '開始分析' }}
+                </button>
+            </div>
+
+            <div v-if="result" class="mt-8 space-y-4 border-t pt-6">
+                <div class="flex justify-between items-center bg-blue-50 p-4 rounded">
+                    <span class="font-bold text-blue-800">📌 綜合目標價</span>
+                    <span class="text-2xl font-extrabold text-blue-600">${{result.target}}</span>
+                </div>
+                <div class="grid grid-cols-2 gap-4 text-sm">
+                    <div class="p-3 border rounded">目前股價: <b>${{result.current_price}}</b></div>
+                    <div class="p-3 border rounded">分析師預期: <b>${{result.analyst_target}}</b></div>
+                    <div class="p-3 border rounded text-green-600">DCF 估值: ${{result.dcf}}</div>
+                    <div class="p-3 border rounded text-green-600">P/E 估值: ${{result.pe}}</div>
+                </div>
+                <p class="text-xs text-gray-400 text-center">計算依據 WACC: {{result.wacc}}</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref } = Vue
+        createApp({
+            setup() {
+                const ticker = ref('')
+                const industry = ref('科技')
+                const result = ref(null)
+                const loading = ref(false)
+                const industries = ['科技', '醫療', '金融', '能源', '消費', '工業']
+
+                const calculate = async () => {
+                    if (!ticker.value) return alert('請輸入代碼')
+                    loading.value = true
+                    try {
+                        const res = await fetch(`/api/evaluate?ticker=${ticker.value}&industry=${industry.value}`)
+                        if (!res.ok) throw new Error('獲取數據失敗')
+                        result.value = await res.json()
+                    } catch (e) {
+                        alert(e.message)
+                    } finally {
+                        loading.value = false
+                    }
+                }
+                return { ticker, industry, result, loading, industries, calculate }
+            }
+        }).mount('#app')
+    </script>
+</body>
+</html>
