@@ -8,9 +8,8 @@ from fastapi.staticfiles import StaticFiles
 app = FastAPI()
 
 # --- 安全設定區 ---
-# 移除原本寫死的 Key，避免程式一直去讀取那個失效的舊 Key
-# 如果環境變數沒抓到，這裡會變為 None，我們在 fetch_fmp 處理
-FMP_API_KEY = os.environ.get("FMP_API_KEY")
+# 務必在 Render 的 Environment Variables 設定 FMP_API_KEY
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "").strip()
 
 usage_stats = {"count": 0, "date": datetime.date.today().isoformat()}
 
@@ -23,10 +22,10 @@ def update_usage():
 
 async def fetch_fmp(endpoint: str, symbol: str, params: dict = None, version: str = "v3"):
     if not FMP_API_KEY:
-        print("!!! 錯誤: 系統找不到 FMP_API_KEY 環境變數")
+        print("!!! 錯誤: 系統找不到 FMP_API_KEY")
         return None
 
-    query_params = {"apikey": FMP_API_KEY.strip()} # 強制移除可能的空白字元
+    query_params = {"apikey": FMP_API_KEY}
     if params:
         query_params.update(params)
     
@@ -38,21 +37,19 @@ async def fetch_fmp(endpoint: str, symbol: str, params: dict = None, version: st
     
     async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            response = await client.get(url, params=query_params, headers=headers, timeout=15.0)
+            response = await client.get(url, params=query_params, headers=headers, timeout=10.0)
             
-            # --- 強力偵錯邏輯 ---
+            # 如果是 403 (權限問題)，直接回傳 None，交給後端降級邏輯處理
             if response.status_code == 403:
-                # 這行會告訴我們究竟是 Key 無效，還是 FMP 擋掉了連線
-                print(f"!!! 403 關鍵錯誤訊息 ({endpoint}): {response.text}")
+                print(f"!!! 權限限制 (403): 跳過端點 {endpoint}")
                 return None
             
             if response.status_code != 200:
-                print(f"API Alert: {endpoint} returned {response.status_code}")
                 return None
-            
+                
             return response.json()
         except Exception as e:
-            print(f"Connection Error at {endpoint}: {e}")
+            print(f"Request Exception at {endpoint}: {e}")
             return None
 
 @app.get("/api/usage")
@@ -62,41 +59,44 @@ async def get_usage():
 @app.get("/api/evaluate")
 async def evaluate(ticker: str, industry: str):
     if not FMP_API_KEY:
-        raise HTTPException(status_code=500, detail="伺服器未設定 API Key")
+        raise HTTPException(status_code=500, detail="API Key 未設定")
 
-    # 1. 抓取數據 (使用穩定版與一般版並行)
+    # 同時抓取所有可能需要的數據 (增加 income-statement 當作備案)
     tasks = [
         fetch_fmp("analyst-estimates", ticker, {"period": "annual", "limit": 1}, version="stable"),
         fetch_fmp("quote", ticker),
         fetch_fmp("balance-sheet-statement", ticker, {"period": "annual", "limit": 1}),
+        fetch_fmp("income-statement", ticker, {"period": "annual", "limit": 1}),
         fetch_fmp("profile", ticker)
     ]
     
     results = await asyncio.gather(*tasks)
-    est_list, quote_list, bal_list, prof_list = results
+    est_list, quote_list, bal_list, inc_list, prof_list = results
 
-    # 基礎檢查：只要 quote 失敗，就代表連線或 Key 有大問題
+    # 基礎檢查
     if not quote_list:
-        raise HTTPException(status_code=404, detail=f"無法從 FMP 獲取數據。請檢查 Log 中的 403 診斷訊息。")
+        raise HTTPException(status_code=404, detail="無法獲取股票基本數據，請檢查 API Key 是否正確設定於 Render")
 
     q = quote_list[0]
     bal = bal_list[0] if bal_list else {}
+    inc = inc_list[0] if inc_list else {}
     p = prof_list[0] if prof_list else {"beta": 1.0}
-    
-    # 判斷數據來源
+
+    # --- 核心邏輯：數據降級策略 ---
+    # 優先使用預測數據，若無則使用最近一期財報數據
     if est_list and isinstance(est_list, list) and len(est_list) > 0:
         est = est_list[0]
         future_eps = est.get('epsAvg', q.get('eps', 0))
         future_ebitda = est.get('ebitdaAvg', 0)
         future_net_income = est.get('netIncomeAvg', 0)
-        data_source = "分析師前瞻數據"
+        data_source = "分析師前瞻預測"
     else:
-        future_eps = q.get('eps', 0)
-        future_ebitda = 0 
-        future_net_income = 0
-        data_source = "當前財報數據 (API 受限)"
+        future_eps = inc.get('eps', q.get('eps', 0))
+        future_ebitda = inc.get('ebitda', 0)
+        future_net_income = inc.get('netIncome', 0)
+        data_source = "最近年度財報 (前瞻 API 受限)"
 
-    # 計算參數
+    # 提取計算參數
     current_price = q.get('price', 0)
     shares = q.get('sharesOutstanding')
     if not shares or shares <= 0:
@@ -105,15 +105,7 @@ async def evaluate(ticker: str, industry: str):
     debt = bal.get('totalDebt', 0)
     cash = bal.get('cashAndCashEquivalents', 0)
 
-    # WACC 估算
-    rf = 0.042 
-    beta = p.get('beta') if p.get('beta') else 1.0
-    re = rf + beta * 0.055 
-    market_cap = q.get('marketCap', current_price * shares)
-    v = market_cap + debt
-    wacc = (market_cap / v) * re + (debt / v) * 0.05 * 0.79 if v > 0 else 0.08
-
-    # 產業參數
+    # 估值計算
     ind_map = {
         '科技': {'pe': 28, 'evebitda': 16, 'growth': 0.04},
         '醫療': {'pe': 22, 'evebitda': 14, 'growth': 0.03},
@@ -124,20 +116,24 @@ async def evaluate(ticker: str, industry: str):
     }
     ind = ind_map.get(industry, ind_map['科技'])
 
-    # 估值計算
+    # 三大模型計算 (增加安全除零檢查)
     v_pe = future_eps * ind['pe']
-    v_ev = ((future_ebitda * ind['evebitda']) - debt + cash) / shares if future_ebitda > 0 else 0
-    v_dcf = ((future_net_income / shares) * (1 + ind['growth'])) / (max(wacc - ind['growth'], 0.01)) if future_net_income > 0 else 0
+    v_ev = ((future_ebitda * ind['evebitda']) - debt + cash) / shares if (future_ebitda > 0 and shares > 0) else 0
+    
+    # 簡單 DCF 估算
+    rf = 0.042
+    beta = p.get('beta') if p.get('beta') else 1.0
+    wacc = max(rf + beta * 0.055, 0.06) 
+    v_dcf = ((future_net_income / shares) * (1 + ind['growth'])) / (max(wacc - ind['growth'], 0.02)) if (future_net_income > 0 and shares > 0) else 0
 
     valid_models = [v for v in [v_pe, v_ev, v_dcf] if v > 0]
-    target = (sum(valid_models) / len(valid_models)) * 1.1 if valid_models else current_price * 1.1
+    target = (sum(valid_models) / len(valid_models)) * 1.1 if valid_models else current_price * 1.05
 
     update_usage()
     
     return {
         "symbol": ticker.upper(),
         "current_price": current_price,
-        "wacc": f"{wacc:.2%}",
         "pe": round(v_pe, 2),
         "ev": round(v_ev, 2),
         "dcf": round(v_dcf, 2),
