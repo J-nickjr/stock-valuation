@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 httpx
-pandas
-pandas-datareader
 yfinance
+pandas
+lxml

@@ -1,15 +1,15 @@
 import os
 import asyncio
-import httpx
 import datetime
+import yfinance as yf
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI()
 
-# --- 安全設定區 ---
-# 請確保在 Render 的 Environment Variables 設定 ALPHA_VANTAGE_KEY
-AV_API_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "").strip()
+# 建立 ThreadPool 處理同步的 yfinance 請求
+executor = ThreadPoolExecutor(max_workers=5)
 
 usage_stats = {"count": 0, "date": datetime.date.today().isoformat()}
 
@@ -20,71 +20,36 @@ def update_usage():
         usage_stats["date"] = today
     usage_stats["count"] += 1
 
-async def fetch_av(function: str, symbol: str):
-    """依照 Alpha Vantage 必填規則進行請求"""
-    if not AV_API_KEY:
-        print("!!! 錯誤: 找不到 ALPHA_VANTAGE_KEY")
+def get_stock_data_sync(ticker_str: str):
+    """同步爬取 Yahoo Finance 數據"""
+    try:
+        stock = yf.Ticker(ticker_str)
+        info = stock.info
+        
+        # 抓取關鍵估值指標
+        return {
+            "symbol": info.get("symbol", ticker_str).upper(),
+            "name": info.get("shortName", "未知公司"),
+            "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
+            "future_eps": info.get("forwardEps") or info.get("trailingEps"),
+            "target_price": info.get("targetMeanPrice"),
+            "beta": info.get("beta", 1.0),
+            "forward_pe": info.get("forwardPE")
+        }
+    except Exception as e:
+        print(f"YFinance Error: {e}")
         return None
-
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": function,
-        "symbol": symbol.upper(),
-        "apikey": AV_API_KEY
-    }
-    
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(url, params=params, timeout=15.0)
-            data = response.json()
-            
-            # 檢查頻率限制 (Alpha Vantage 免費版限制)
-            if "Note" in data:
-                print(f"!!! AV 限制提示: {data['Note']}")
-                return "LIMIT"
-            return data
-        except Exception as e:
-            print(f"AV API Error ({function}): {e}")
-            return None
 
 @app.get("/api/evaluate")
 async def evaluate(ticker: str, industry: str):
-    if not AV_API_KEY:
-        raise HTTPException(status_code=500, detail="伺服器 API Key 設定缺失")
+    loop = asyncio.get_event_loop()
+    # 將同步的 yfinance 丟進 ThreadPool 跑
+    data = await loop.run_in_executor(executor, get_stock_data_sync, ticker)
 
-    # 1. 同時抓取即時報價與預測 EPS
-    # 依照要求使用關鍵字 function=EARNINGS_ESTIMATES
-    tasks = [
-        fetch_av("GLOBAL_QUOTE", ticker),
-        fetch_av("EARNINGS_ESTIMATES", ticker)
-    ]
-    
-    results = await asyncio.gather(*tasks)
-    quote_data, estimates_data = results
+    if not data or not data["current_price"]:
+        raise HTTPException(status_code=404, detail="無法獲取數據，請確認股票代號是否正確 (例如 AAPL)")
 
-    if quote_data == "LIMIT" or estimates_data == "LIMIT":
-        raise HTTPException(status_code=429, detail="API 請求過於頻繁，請一分鐘後再試")
-
-    # 2. 解析股價
-    quote = quote_data.get("Global Quote", {})
-    current_price = float(quote.get("05. price", 0))
-    if current_price == 0:
-        raise HTTPException(status_code=404, detail="找不到股價數據，請確認 Ticker 正確")
-
-    # 3. 解析分析師預測 (EARNINGS_ESTIMATES)
-    # 我們抓取年度預測 (annualEstimates) 中的第一筆，通常是未來一年
-    future_eps = 0
-    estimates_list = estimates_data.get("annualEstimates", [])
-    if estimates_list:
-        # 取得清單中最新的一筆預測
-        future_eps = float(estimates_list[0].get("estimated_eps_avg", 0))
-        data_source = f"分析師預測 ({estimates_list[0].get('period', '下年度')})"
-    else:
-        # 降級方案：如果沒預測，嘗試從 quote 抓 TTM EPS
-        data_source = "無預測數據，使用歷史數據"
-        future_eps = 0 # 若要更嚴謹，可再抓一次 OVERVIEW
-
-    # 4. 估值計算
+    # 產業估值參數
     ind_map = {
         '科技': {'pe': 28, 'growth': 0.04},
         '醫療': {'pe': 22, 'growth': 0.03},
@@ -95,26 +60,33 @@ async def evaluate(ticker: str, industry: str):
     }
     ind = ind_map.get(industry, ind_map['科技'])
 
-    # 計算模型
-    v_pe = future_eps * ind['pe'] if future_eps > 0 else 0
-    
-    # 由於 EARNINGS_ESTIMATES 只給 EPS，DCF 我們使用簡化模型
-    # 假設未來折現率 8%
-    v_dcf = (future_eps * (1 + ind['growth'])) / (0.08 - ind['growth']) if future_eps > 0 else 0
+    price = data["current_price"]
+    eps = data["future_eps"] or 0
+    analyst_target = data["target_price"] or 0
 
-    # 綜合目標價
-    valid_models = [v for v in [v_pe, v_dcf] if v > 0]
-    target = sum(valid_models) / len(valid_models) if valid_models else current_price * 1.05
+    # 1. 產業本益比估值
+    v_pe = eps * ind['pe'] if eps > 0 else 0
+    
+    # 2. 簡化版 DCF (根據 Beta 調整折現率)
+    rf = 0.042
+    wacc = max(rf + data["beta"] * 0.055, 0.06)
+    v_dcf = (eps * (1 + ind['growth'])) / (max(wacc - ind['growth'], 0.02)) if eps > 0 else 0
+
+    # 3. 綜合目標價 (分析師+PE+DCF 權重平均)
+    valid_vals = [v for v in [v_pe, analyst_target, v_dcf] if v > 0]
+    final_target = sum(valid_vals) / len(valid_vals) if valid_vals else price * 1.1
 
     update_usage()
-    
+
     return {
-        "symbol": ticker.upper(),
-        "current_price": current_price,
-        "pe": round(v_pe, 2),
-        "dcf": round(v_dcf, 2),
-        "target": round(target, 2),
-        "data_source": data_source,
+        "symbol": data["symbol"],
+        "name": data["name"],
+        "current_price": round(price, 2),
+        "pe_valuation": round(v_pe, 2),
+        "analyst_target": round(analyst_target, 2),
+        "dcf_valuation": round(v_dcf, 2),
+        "target": round(final_target, 2),
+        "data_source": "Yahoo Finance (爬蟲免Key版)",
         "server_usage": usage_stats["count"]
     }
 
