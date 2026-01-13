@@ -8,15 +8,8 @@ from fastapi.staticfiles import StaticFiles
 app = FastAPI()
 
 # --- 安全設定區 ---
-# 獲取 Key 並立即進行過濾，防止換行符號或空白導致 403
-RAW_KEY = os.environ.get("FMP_API_KEY", "")
-FMP_API_KEY = "".join(RAW_KEY.split()) # 移除所有空白、換行、定位符
-
-# 啟動時在 Log 印出檢查 (僅顯示前後字元，保護隱私)
-if not FMP_API_KEY:
-    print("!!! 嚴重警告: Render 環境變數中找不到 FMP_API_KEY !!!")
-else:
-    print(f"--- 系統啟動: API Key 檢測成功 ({FMP_API_KEY[:4]}...{FMP_API_KEY[-4:]}) ---")
+# 請確保在 Render 的 Environment Variables 設定 ALPHA_VANTAGE_KEY
+AV_API_KEY = os.environ.get("ALPHA_VANTAGE_KEY", "").strip()
 
 usage_stats = {"count": 0, "date": datetime.date.today().isoformat()}
 
@@ -27,107 +20,91 @@ def update_usage():
         usage_stats["date"] = today
     usage_stats["count"] += 1
 
-async def fetch_fmp(endpoint: str, symbol: str, params: dict = None, version: str = "v3"):
-    if not FMP_API_KEY:
+async def fetch_av(function: str, symbol: str):
+    """依照 Alpha Vantage 必填規則進行請求"""
+    if not AV_API_KEY:
+        print("!!! 錯誤: 找不到 ALPHA_VANTAGE_KEY")
         return None
 
-    query_params = {"apikey": FMP_API_KEY}
-    if params:
-        query_params.update(params)
-    
-    url = f"https://financialmodelingprep.com/api/{version}/{endpoint}/{symbol.upper()}"
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": function,
+        "symbol": symbol.upper(),
+        "apikey": AV_API_KEY
     }
     
-    async with httpx.AsyncClient(follow_redirects=True) as client:
+    async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, params=query_params, headers=headers, timeout=10.0)
+            response = await client.get(url, params=params, timeout=15.0)
+            data = response.json()
             
-            if response.status_code == 403:
-                # 這是最核心的除錯資訊
-                print(f"!!! 403 拒絕存取 ({endpoint}): 請檢查 FMP 官網 API 狀態或 Key 是否正確")
-                return None
-            
-            if response.status_code != 200:
-                return None
-                
-            return response.json()
+            # 檢查頻率限制 (Alpha Vantage 免費版限制)
+            if "Note" in data:
+                print(f"!!! AV 限制提示: {data['Note']}")
+                return "LIMIT"
+            return data
         except Exception as e:
-            print(f"連線異常: {e}")
+            print(f"AV API Error ({function}): {e}")
             return None
-
-@app.get("/api/usage")
-async def get_usage():
-    return {"usage": usage_stats["count"]}
 
 @app.get("/api/evaluate")
 async def evaluate(ticker: str, industry: str):
-    if not FMP_API_KEY:
-        raise HTTPException(status_code=500, detail="伺服器未設定 API Key，請檢查 Render 環境變數")
+    if not AV_API_KEY:
+        raise HTTPException(status_code=500, detail="伺服器 API Key 設定缺失")
 
-    # 執行抓取
+    # 1. 同時抓取即時報價與預測 EPS
+    # 依照要求使用關鍵字 function=EARNINGS_ESTIMATES
     tasks = [
-        fetch_fmp("analyst-estimates", ticker, {"period": "annual", "limit": 1}, version="stable"),
-        fetch_fmp("quote", ticker),
-        fetch_fmp("income-statement", ticker, {"period": "annual", "limit": 1}),
-        fetch_fmp("balance-sheet-statement", ticker, {"period": "annual", "limit": 1}),
-        fetch_fmp("profile", ticker)
+        fetch_av("GLOBAL_QUOTE", ticker),
+        fetch_av("EARNINGS_ESTIMATES", ticker)
     ]
     
     results = await asyncio.gather(*tasks)
-    est_list, quote_list, inc_list, bal_list, prof_list = results
+    quote_data, estimates_data = results
 
-    # 檢查是否全部失敗
-    if not quote_list or not isinstance(quote_list, list):
-        # 這裡提供更詳細的 UI 報錯
-        raise HTTPException(status_code=403, detail="API Key 驗證失敗或額度耗盡，請確認後端 Log")
+    if quote_data == "LIMIT" or estimates_data == "LIMIT":
+        raise HTTPException(status_code=429, detail="API 請求過於頻繁，請一分鐘後再試")
 
-    q = quote_list[0]
-    inc = inc_list[0] if (inc_list and len(inc_list)>0) else {}
-    bal = bal_list[0] if (bal_list and len(bal_list)>0) else {}
-    p = prof_list[0] if (prof_list and len(prof_list)>0) else {"beta": 1.0}
+    # 2. 解析股價
+    quote = quote_data.get("Global Quote", {})
+    current_price = float(quote.get("05. price", 0))
+    if current_price == 0:
+        raise HTTPException(status_code=404, detail="找不到股價數據，請確認 Ticker 正確")
 
-    # 數據降級邏輯
-    if est_list and isinstance(est_list, list) and len(est_list) > 0:
-        est = est_list[0]
-        future_eps = est.get('epsAvg', q.get('eps', 0))
-        future_ebitda = est.get('ebitdaAvg', 0)
-        future_net_income = est.get('netIncomeAvg', 0)
-        data_source = "分析師前瞻預測"
+    # 3. 解析分析師預測 (EARNINGS_ESTIMATES)
+    # 我們抓取年度預測 (annualEstimates) 中的第一筆，通常是未來一年
+    future_eps = 0
+    estimates_list = estimates_data.get("annualEstimates", [])
+    if estimates_list:
+        # 取得清單中最新的一筆預測
+        future_eps = float(estimates_list[0].get("estimated_eps_avg", 0))
+        data_source = f"分析師預測 ({estimates_list[0].get('period', '下年度')})"
     else:
-        future_eps = inc.get('eps', q.get('eps', 0))
-        future_ebitda = inc.get('ebitda', 0)
-        future_net_income = inc.get('netIncome', 0)
-        data_source = "最近年度財報 (前瞻 API 受限)"
+        # 降級方案：如果沒預測，嘗試從 quote 抓 TTM EPS
+        data_source = "無預測數據，使用歷史數據"
+        future_eps = 0 # 若要更嚴謹，可再抓一次 OVERVIEW
 
-    # 核心估值邏輯
-    current_price = q.get('price', 0)
-    shares = q.get('sharesOutstanding', 1)
-    debt = bal.get('totalDebt', 0)
-    cash = bal.get('cashAndCashEquivalents', 0)
-
+    # 4. 估值計算
     ind_map = {
-        '科技': {'pe': 28, 'evebitda': 16, 'growth': 0.04},
-        '醫療': {'pe': 22, 'evebitda': 14, 'growth': 0.03},
-        '金融': {'pe': 12, 'evebitda': 10, 'growth': 0.02},
-        '能源': {'pe': 10, 'evebitda': 8, 'growth': 0.02},
-        '消費': {'pe': 18, 'evebitda': 12, 'growth': 0.03},
-        '工業': {'pe': 16, 'evebitda': 11, 'growth': 0.025}
+        '科技': {'pe': 28, 'growth': 0.04},
+        '醫療': {'pe': 22, 'growth': 0.03},
+        '金融': {'pe': 12, 'growth': 0.02},
+        '能源': {'pe': 10, 'growth': 0.02},
+        '消費': {'pe': 18, 'growth': 0.03},
+        '工業': {'pe': 16, 'growth': 0.025}
     }
     ind = ind_map.get(industry, ind_map['科技'])
 
-    v_pe = future_eps * ind['pe']
-    v_ev = ((future_ebitda * ind['evebitda']) - debt + cash) / shares if (future_ebitda > 0 and shares > 0) else 0
+    # 計算模型
+    v_pe = future_eps * ind['pe'] if future_eps > 0 else 0
     
-    rf = 0.042
-    beta = p.get('beta', 1.0)
-    wacc = max(rf + beta * 0.055, 0.06) 
-    v_dcf = ((future_net_income / shares) * (1 + ind['growth'])) / (max(wacc - ind['growth'], 0.02)) if (future_net_income > 0 and shares > 0) else 0
+    # 由於 EARNINGS_ESTIMATES 只給 EPS，DCF 我們使用簡化模型
+    # 假設未來折現率 8%
+    v_dcf = (future_eps * (1 + ind['growth'])) / (0.08 - ind['growth']) if future_eps > 0 else 0
 
-    valid_models = [v for v in [v_pe, v_ev, v_dcf] if v > 0]
-    target = (sum(valid_models) / len(valid_models)) * 1.1 if valid_models else current_price * 1.05
+    # 綜合目標價
+    valid_models = [v for v in [v_pe, v_dcf] if v > 0]
+    target = sum(valid_models) / len(valid_models) if valid_models else current_price * 1.05
 
     update_usage()
     
@@ -135,7 +112,6 @@ async def evaluate(ticker: str, industry: str):
         "symbol": ticker.upper(),
         "current_price": current_price,
         "pe": round(v_pe, 2),
-        "ev": round(v_ev, 2),
         "dcf": round(v_dcf, 2),
         "target": round(target, 2),
         "data_source": data_source,
