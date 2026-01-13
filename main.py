@@ -21,31 +21,42 @@ def update_usage():
 
 async def fetch_fmp(endpoint: str, symbol: str, params: dict = None, version: str = "v3"):
     """
-    支援切換 API 版本 (v3, v4, 或 stable)
+    加入 User-Agent 偽裝與重定向支援，解決雲端環境 403 問題
     """
     query_params = {"apikey": FMP_API_KEY}
     if params:
         query_params.update(params)
     
-    # 根據傳入的 version 組合成網址
     url = f"https://financialmodelingprep.com/api/{version}/{endpoint}/{symbol.upper()}"
     
-    async with httpx.AsyncClient() as client:
+    # 關鍵修正：模擬真實瀏覽器的 Headers
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+    
+    # 使用 follow_redirects=True 處理可能的跳轉
+    async with httpx.AsyncClient(follow_redirects=True) as client:
         try:
-            response = await client.get(url, params=query_params, timeout=15.0)
-            data = response.json()
+            response = await client.get(url, params=query_params, headers=headers, timeout=15.0)
             
-            # 診斷用 Log
+            # 診斷 Log：如果還是 403，印出前 100 字元判定是誰擋的
+            if response.status_code == 403:
+                print(f"!!! 403 Forbidden at {endpoint}: {response.text[:100]}")
+                return None
+            
             if response.status_code != 200:
                 print(f"FMP API Alert: {endpoint} returned {response.status_code}")
                 return None
             
+            data = response.json()
             if isinstance(data, dict) and "Error Message" in data:
                 print(f"FMP Detail Error: {data['Error Message']}")
                 return None
             return data
         except Exception as e:
-            print(f"Connection Error: {e}")
+            print(f"Connection Error at {endpoint}: {e}")
             return None
 
 @app.get("/api/usage")
@@ -57,7 +68,7 @@ async def evaluate(ticker: str, industry: str):
     if usage_stats["count"] >= 250:
         raise HTTPException(status_code=403, detail="全站額度已用完，請明天再試")
 
-    # 1. 抓取數據 (修正重點：分析師預估改用 stable 路徑)
+    # 1. 抓取數據 (使用優化後的 fetch_fmp)
     tasks = [
         fetch_fmp("analyst-estimates", ticker, {"period": "annual", "limit": 1}, version="stable"),
         fetch_fmp("quote", ticker),
@@ -70,14 +81,13 @@ async def evaluate(ticker: str, industry: str):
 
     # 基礎檢查
     if not quote_list or len(quote_list) == 0:
-        raise HTTPException(status_code=404, detail=f"無法獲取 {ticker} 的基本報價數據")
+        # 如果所有請求都 403，這裡會報 404
+        raise HTTPException(status_code=404, detail=f"無法獲取 {ticker} 的基本數據，可能 API 連線被阻擋")
 
     q = quote_list[0]
     bal = bal_list[0] if bal_list else {}
     p = prof_list[0] if prof_list else {"beta": 1.0}
     
-    # --- 關鍵修正：數據降級策略 ---
-    # 如果 stable 路徑還是拿不到數據 (新帳號權限)，就自動改用現有數據 (v3/quote)
     if est_list and isinstance(est_list, list) and len(est_list) > 0:
         est = est_list[0]
         future_eps = est.get('epsAvg', q.get('eps', 0))
@@ -85,13 +95,11 @@ async def evaluate(ticker: str, industry: str):
         future_net_income = est.get('netIncomeAvg', 0)
         data_source = "分析師前瞻數據 (Stable API)"
     else:
-        # 如果失敗，改用當前 TTM 數據當基準
         future_eps = q.get('eps', 0)
         future_ebitda = 0 
         future_net_income = 0
         data_source = "當前財報數據 (前瞻 API 受限)"
 
-    # 參數處理
     shares = q.get('sharesOutstanding')
     if not shares or shares <= 0:
         shares = p.get('mktCap', 0) / q.get('price', 1) if q.get('price', 0) > 0 else 1
@@ -124,7 +132,6 @@ async def evaluate(ticker: str, industry: str):
     v_ev = ((future_ebitda * ind['evebitda']) - debt + cash) / shares if future_ebitda > 0 else 0
     v_dcf = ((future_net_income / shares) * (1 + ind['growth'])) / (max(wacc - ind['growth'], 0.01)) if future_net_income > 0 else 0
 
-    # 綜合目標價
     valid_models = [v for v in [v_pe, v_ev, v_dcf] if v > 0]
     target = (sum(valid_models) / len(valid_models)) * 1.1 if valid_models else current_price * 1.1
 
