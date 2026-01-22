@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+httpx
+yfinance==1.0.0
+pandas
+lxml
+beautifulsoup4

@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>全球股票價值估值器 (美股/台股)</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Microsoft JhengHei", sans-serif;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 min-h-screen text-slate-800">
+    <div id="app" class="max-w-2xl mx-auto py-12 px-6">
+        <div class="bg-white shadow-xl shadow-blue-100/50 rounded-2xl overflow-hidden border border-slate-100">
+            
+            <div class="bg-blue-600 py-8 px-6 text-center">
+                <h1 class="text-2xl font-bold text-white tracking-tight">價值投資估值器</h1>
+                <p class="text-blue-100 text-sm mt-2 opacity-90">支援美股(代號)與台股(數字)搜尋</p>
+            </div>
+
+            <div class="p-8">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-500 uppercase mb-1 ml-1">股票代碼</label>
+                        <input v-model="ticker" placeholder="美股: AAPL / 台股: 2330" 
+                               class="w-full border border-slate-200 p-3 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition-all">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-500 uppercase mb-1 ml-1">所屬產業</label>
+                        <select v-model="industry" class="w-full border border-slate-200 p-3 rounded-xl bg-white outline-none focus:ring-2 focus:ring-blue-500">
+                            <option v-for="opt in industries" :key="opt" :value="opt">{{opt}}</option>
+                        </select>
+                    </div>
+                </div>
+
+                <button @click="calculate" :disabled="loading" 
+                        class="w-full bg-blue-600 text-white font-bold py-4 rounded-xl hover:bg-blue-700 active:scale-[0.98] transition-all disabled:bg-slate-300 shadow-lg shadow-blue-200">
+                    <span v-if="!loading">開始分析數據</span>
+                    <span v-else class="flex items-center justify-center">
+                        <svg class="animate-spin h-5 w-5 mr-3 border-2 border-white border-t-transparent rounded-full" viewBox="0 0 24 24"></svg>
+                        計算中...
+                    </span>
+                </button>
+
+                <div v-if="result" class="mt-10 space-y-6 animate-in fade-in duration-500">
+                    
+                    <div class="bg-gradient-to-br from-blue-50 to-indigo-50 p-6 rounded-2xl border border-blue-100 text-center">
+                        <div class="text-sm font-bold text-blue-500 mb-1">{{result.symbol}} - {{result.name}}</div>
+                        <span class="text-sm font-medium text-blue-600 uppercase tracking-widest">📌 綜合目標價 (含安全邊際)</span>
+                        <div class="text-4xl font-black text-blue-700 mt-2">{{result.currency}}{{result.target}}</div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4">
+                        <div class="p-4 bg-slate-50 rounded-xl border border-slate-100">
+                            <div class="text-xs text-slate-500 mb-1">目前股價</div>
+                            <div class="text-lg font-bold text-slate-700">{{result.currency}}{{result.current_price}}</div>
+                        </div>
+                        <div class="p-4 bg-slate-50 rounded-xl border border-slate-100">
+                            <div class="text-xs text-slate-500 mb-1">分析師預期</div>
+                            <div class="text-lg font-bold text-slate-700">{{result.currency}}{{result.analyst_target}}</div>
+                        </div>
+                    </div>
+
+                    <div class="space-y-3">
+                        <h3 class="text-xs font-bold text-slate-400 uppercase tracking-widest ml-1">估值組成 (Valuation Components)</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div class="p-4 bg-emerald-50 rounded-xl border border-emerald-100">
+                                <div class="text-xs text-emerald-600 font-medium">DCF 估值</div>
+                                <div class="text-xl font-bold text-emerald-700">{{result.currency}}{{result.dcf}}</div>
+                            </div>
+                            <div class="p-4 bg-emerald-50 rounded-xl border border-emerald-100">
+                                <div class="text-xs text-emerald-600 font-medium">P/E 估值</div>
+                                <div class="text-xl font-bold text-emerald-700">{{result.currency}}{{result.pe}}</div>
+                            </div>
+                            <div class="p-4 bg-emerald-50 rounded-xl border border-emerald-100">
+                                <div class="text-xs text-emerald-600 font-medium">EV/EBITDA</div>
+                                <div class="text-xl font-bold text-emerald-700">{{result.currency}}{{result.ev}}</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <p class="text-[10px] text-slate-400 text-center leading-relaxed">
+                        本報告基於加權平均資本成本 (WACC: {{result.wacc}}) 計算。<br>
+                        所有數據源自 Yahoo Finance，投資前請自行評估風險。
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref } = Vue
+        createApp({
+            setup() {
+                const ticker = ref('')
+                const industry = ref('科技')
+                const result = ref(null)
+                const loading = ref(false)
+                const industries = ['科技', '醫療', '金融', '能源', '消費', '工業']
+
+                const calculate = async () => {
+                    if (!ticker.value) return alert('請輸入股票代碼')
+                    loading.value = true
+                    result.value = null 
+                    try {
+                        const res = await fetch(`/api/evaluate?ticker=${ticker.value}&industry=${industry.value}`)
+                        if (!res.ok) {
+                            const errorData = await res.json();
+                            throw new Error(errorData.detail || '無法獲取數據');
+                        }
+                        result.value = await res.json()
+                    } catch (e) {
+                        alert(e.message)
+                    } finally {
+                        loading.value = false
+                    }
+                }
+                return { ticker, industry, result, loading, industries, calculate }
+            }
+        }).mount('#app')
+    </script>
+</body>
+</html>
