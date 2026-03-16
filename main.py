@@ -59,10 +59,25 @@ def get_stock_data_sync(ticker_str: str):
             stock = yf.Ticker(t)
             try:
                 temp_info = stock.info
-                if temp_info and ("currentPrice" in temp_info or "regularMarketPrice" in temp_info):
-                    info = temp_info
-                    final_ticker = t
-                    break
+                # 只要有 symbol 或 shortName 就視為有效
+                if temp_info and (temp_info.get("symbol") or temp_info.get("shortName")):
+                    # 嘗試從多個欄位取得股價
+                    price = (
+                        temp_info.get("currentPrice")
+                        or temp_info.get("regularMarketPrice")
+                        or temp_info.get("previousClose")
+                    )
+                    # 若 info 沒有股價，改用 fast_info
+                    if not price:
+                        try:
+                            price = stock.fast_info.last_price
+                        except Exception:
+                            price = None
+                    if price:
+                        info = temp_info
+                        info["_price"] = price
+                        final_ticker = t
+                        break
             except Exception:
                 continue
 
@@ -72,7 +87,7 @@ def get_stock_data_sync(ticker_str: str):
         return {
             "symbol": info.get("symbol", final_ticker).upper(),
             "name": info.get("shortName", ""),
-            "current_price": info.get("currentPrice") or info.get("regularMarketPrice", 0),
+            "current_price": info.get("_price", 0),
             "future_eps": info.get("forwardEps") or info.get("trailingEps", 0),
             "peg": info.get("pegRatio", 0),
             "eps_growth": info.get("earningsGrowth", 0),
