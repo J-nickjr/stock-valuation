@@ -1,7 +1,9 @@
 fastapi
 uvicorn
 httpx
-yfinance==1.0.0
+yfinance
 pandas
 lxml
 beautifulsoup4
+line-bot-sdk>=3.0.0
+python-dotenv
