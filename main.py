@@ -46,60 +46,54 @@ def get_stock_data_sync(ticker_str: str):
         search_tickers = []
 
         if raw_ticker.isdigit():
-            # 台股：嘗試上市(.TW)與上櫃(.TWO)
             search_tickers = [f"{raw_ticker}.TW", f"{raw_ticker}.TWO"]
         else:
-            # 美股：直接搜尋
             search_tickers = [raw_ticker]
 
-        info = None
-        final_ticker = ""
-
         for t in search_tickers:
-            stock = yf.Ticker(t)
             try:
-                temp_info = stock.info
-                # 只要有 symbol 或 shortName 就視為有效
-                if temp_info and (temp_info.get("symbol") or temp_info.get("shortName")):
-                    # 嘗試從多個欄位取得股價
-                    price = (
-                        temp_info.get("currentPrice")
-                        or temp_info.get("regularMarketPrice")
-                        or temp_info.get("previousClose")
-                    )
-                    # 若 info 沒有股價，改用 fast_info
-                    if not price:
-                        try:
-                            price = stock.fast_info.last_price
-                        except Exception:
-                            price = None
-                    if price:
-                        info = temp_info
-                        info["_price"] = price
-                        final_ticker = t
-                        break
-            except Exception:
+                stock = yf.Ticker(t)
+
+                # fast_info 比 info 更穩定，優先使用
+                fi = stock.fast_info
+                price = getattr(fi, "last_price", None) or getattr(fi, "previous_close", None)
+                currency = getattr(fi, "currency", "USD") or "USD"
+
+                print(f"[{t}] fast_info price={price} currency={currency}")
+
+                if not price:
+                    print(f"[{t}] 無法取得股價，略過")
+                    continue
+
+                # info 用來取補充資料，失敗不影響主流程
+                info = {}
+                try:
+                    info = stock.info or {}
+                except Exception as e:
+                    print(f"[{t}] info 失敗（略過）: {e}")
+
+                return {
+                    "symbol": (info.get("symbol") or t).upper(),
+                    "name": info.get("shortName", ""),
+                    "current_price": price,
+                    "future_eps": info.get("forwardEps") or info.get("trailingEps", 0),
+                    "peg": info.get("pegRatio", 0),
+                    "eps_growth": info.get("earningsGrowth", 0),
+                    "target_mean": info.get("targetMeanPrice", 0),
+                    "beta": info.get("beta", 1.0),
+                    "ebitda": info.get("ebitda", 0),
+                    "total_debt": info.get("totalDebt", 0),
+                    "total_cash": info.get("totalCash", 0),
+                    "shares": info.get("sharesOutstanding") or getattr(fi, "shares", 1) or 1,
+                    "currency": currency,
+                    "sector": info.get("sector", ""),
+                }
+            except Exception as e:
+                print(f"[{t}] 例外: {e}")
                 continue
 
-        if not info:
-            return None
-
-        return {
-            "symbol": info.get("symbol", final_ticker).upper(),
-            "name": info.get("shortName", ""),
-            "current_price": info.get("_price", 0),
-            "future_eps": info.get("forwardEps") or info.get("trailingEps", 0),
-            "peg": info.get("pegRatio", 0),
-            "eps_growth": info.get("earningsGrowth", 0),
-            "target_mean": info.get("targetMeanPrice", 0),
-            "beta": info.get("beta", 1.0),
-            "ebitda": info.get("ebitda", 0),
-            "total_debt": info.get("totalDebt", 0),
-            "total_cash": info.get("totalCash", 0),
-            "shares": info.get("sharesOutstanding", 1),
-            "currency": info.get("currency", "USD"),
-            "sector": info.get("sector", ""),
-        }
+        print(f"所有代碼均無法取得資料: {search_tickers}")
+        return None
     except Exception as e:
         print(f"YFinance Error: {e}")
         return None
