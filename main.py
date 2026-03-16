@@ -134,13 +134,8 @@ def compute_evaluation(data: dict) -> dict:
     wacc_str = f"{round(wacc_val * 100, 2)}%"
 
     # 各估值模型
-    # P/E 估值 = PEG × EPS成長率(%) × 明年預估EPS
-    peg = data.get("peg", 0)
-    eps_growth = data.get("eps_growth", 0)  # yfinance 回傳小數，如 0.15 = 15%
-    if peg > 0 and eps_growth > 0 and data["future_eps"] > 0:
-        v_pe = peg * (eps_growth * 100) * data["future_eps"]
-    else:
-        v_pe = 0
+    # P/E 估值 = 產業平均 PE × 明年預估 EPS
+    v_pe = ind["pe"] * data["future_eps"] if data["future_eps"] > 0 else 0
 
     if data["ebitda"] > 0 and data["shares"] > 0:
         v_ev = (data["ebitda"] * 12 - data["total_debt"] + data["total_cash"]) / data["shares"]
