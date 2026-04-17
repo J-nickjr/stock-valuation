@@ -1,6 +1,8 @@
 import asyncio
 import os
+import time
 import yfinance as yf
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -18,8 +20,35 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 load_dotenv()
 
-app = FastAPI()
 executor = ThreadPoolExecutor(max_workers=5)
+
+# 快取：避免短時間內重複打 Yahoo Finance 同一支股票
+_cache: dict[str, tuple[dict, float]] = {}
+CACHE_TTL = 300  # 5 分鐘
+
+
+def prewarm():
+    """啟動時預先初始化 curl_cffi session，避免第一次請求超時。"""
+    for attempt in range(3):
+        try:
+            yf.Ticker("AAPL").fast_info
+            print("[YF] curl_cffi session 預熱成功")
+            return
+        except Exception as e:
+            print(f"[YF] 預熱失敗第 {attempt+1} 次: {e}")
+            if attempt < 2:
+                time.sleep(5)
+    print("[YF] 預熱全部失敗，服務仍會繼續，但首次查詢可能較慢")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(executor, prewarm)
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
@@ -51,6 +80,12 @@ def get_stock_data_sync(ticker_str: str):
             search_tickers = [raw_ticker]
 
         for t in search_tickers:
+            if t in _cache:
+                cached_data, cached_at = _cache[t]
+                if time.time() - cached_at < CACHE_TTL:
+                    print(f"[Cache] {t} 命中快取")
+                    return cached_data
+
             try:
                 stock = yf.Ticker(t)
 
@@ -72,7 +107,7 @@ def get_stock_data_sync(ticker_str: str):
                 except Exception as e:
                     print(f"[{t}] info 失敗（略過）: {e}")
 
-                return {
+                result = {
                     "symbol": (info.get("symbol") or t).upper(),
                     "name": info.get("shortName", ""),
                     "current_price": price,
@@ -88,6 +123,8 @@ def get_stock_data_sync(ticker_str: str):
                     "currency": currency,
                     "sector": info.get("sector", ""),
                 }
+                _cache[t] = (result, time.time())
+                return result
             except Exception as e:
                 print(f"[{t}] 例外: {e}")
                 continue
@@ -248,6 +285,11 @@ def handle_message(event):
                 )
         except Exception:
             pass
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
 @app.post("/webhook")
